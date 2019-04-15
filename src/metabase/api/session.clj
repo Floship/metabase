@@ -99,14 +99,14 @@
 
 (api/defendpoint POST "/"
   "Login."
-  [:as {{:keys [username password]} :body, remote-address :remote-addr}]
+  [:as {{:keys [username password]} :body, remote-address :remote-addr, :as request}]
   {username su/NonBlankString
    password su/NonBlankString}
   (throttle-check (login-throttlers :ip-address) remote-address)
   (throttle-check (login-throttlers :username)   username)
   (let [session-id (login username password)
         response   {:id session-id}]
-    (mw.session/set-session-cookie response session-id)))
+    (mw.session/set-session-cookie request response session-id)))
 
 
 (api/defendpoint DELETE "/"
@@ -134,7 +134,7 @@
   (throttle-check (forgot-password-throttlers :ip-address) remote-address)
   (throttle-check (forgot-password-throttlers :email)      email)
   ;; Don't leak whether the account doesn't exist, just pretend everything is ok
-  (when-let [{user-id :id, google-auth? :google_auth} (db/select-one ['User :id :google_auth]
+  (when-let [{user-id :id, google-auth? :google_auth} (db/select-one [User :id :google_auth]
                                                         :email email, :is_active true)]
     (let [reset-token        (user/set-password-reset-token! user-id)
           password-reset-url (str (public-settings/site-url) "/auth/reset_password/" reset-token)]
@@ -164,7 +164,7 @@
 
 (api/defendpoint POST "/reset_password"
   "Reset password with a reset token."
-  [:as {{:keys [token password]} :body}]
+  [:as {{:keys [token password]} :body, :as request}]
   {token    su/NonBlankString
    password su/ComplexPassword}
   (or (when-let [{user-id :id, :as user} (valid-reset-token->user token)]
@@ -176,6 +176,7 @@
         ;; after a successful password update go ahead and offer the client a new session that they can use
         (let [session-id (create-session! user)]
           (mw.session/set-session-cookie
+           request
            {:success    true
             :session_id (str session-id)}
            session-id)))
@@ -253,7 +254,7 @@
 
 (api/defendpoint POST "/google_auth"
   "Login with Google Auth."
-  [:as {{:keys [token]} :body, remote-address :remote-addr}]
+  [:as {{:keys [token]} :body, remote-address :remote-addr, :as request}]
   {token su/NonBlankString}
   (throttle-check (login-throttlers :ip-address) remote-address)
   ;; Verify the token is valid with Google
@@ -261,7 +262,7 @@
     (log/info (trs "Successfully authenticated Google Auth token for: {0} {1}" given_name family_name))
     (let [session-id (api/check-500 (google-auth-fetch-or-create-user! given_name family_name email))
           response   {:id session-id}]
-      (mw.session/set-session-cookie response session-id))))
+      (mw.session/set-session-cookie request response session-id))))
 
 
 (api/define-routes)

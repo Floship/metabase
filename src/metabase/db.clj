@@ -97,7 +97,7 @@
      (log/warn
       (u/format-color 'red
           (str
-           (trs "WARNING: Using Metabase with an H2 application database is not recomended for production deployments.")
+           (trs "WARNING: Using Metabase with an H2 application database is not recommended for production deployments.")
            " "
            (trs "For production deployments, we highly recommend using Postgres, MySQL, or MariaDB instead.")
            " "
@@ -348,7 +348,7 @@
    "initialPoolSize" 1
    "maxPoolSize"     15})
 
-(defn connection-pool
+(defn- new-connection-pool
   "Create a C3P0 connection pool for the given database `spec`."
   [spec]
   (connection-pool/connection-pool-spec spec application-db-connection-pool-properties))
@@ -358,7 +358,7 @@
                                    :postgres :ansi
                                    :h2       :h2
                                    :mysql    :mysql))
-  (db/set-default-db-connection! (connection-pool spec)))
+  (db/set-default-db-connection! (new-connection-pool spec)))
 
 
 ;;; +----------------------------------------------------------------------------------------------------------------+
