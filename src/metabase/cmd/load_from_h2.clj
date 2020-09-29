@@ -14,14 +14,11 @@
    mysql -u root -e 'DROP DATABASE IF EXISTS metabase; CREATE DATABASE metabase;'
    MB_DB_TYPE=mysql MB_DB_HOST=localhost MB_DB_PORT=3305 MB_DB_USER=root MB_DB_DBNAME=metabase lein run load-from-h2
    ```"
-  (:require [clojure
-             [set :as set]
-             [string :as str]]
-            [clojure.java
+  (:require [clojure.java
              [io :as io]
              [jdbc :as jdbc]]
+            [clojure.string :as str]
             [colorize.core :as color]
-            [medley.core :as m]
             [metabase
              [db :as mdb]
              [util :as u]]
@@ -43,6 +40,7 @@
              [field-values :refer [FieldValues]]
              [metric :refer [Metric]]
              [metric-important-field :refer [MetricImportantField]]
+             [native-query-snippet :refer [NativeQuerySnippet]]
              [permissions :refer [Permissions]]
              [permissions-group :refer [PermissionsGroup]]
              [permissions-group-membership :refer [PermissionsGroupMembership]]
@@ -58,6 +56,7 @@
              [table :refer [Table]]
              [user :refer [User]]
              [view-log :refer [ViewLog]]]
+            [metabase.util.i18n :refer [trs]]
             [toucan.db :as db])
   (:import java.sql.SQLException))
 
@@ -67,7 +66,7 @@
 
 ;;; ------------------------------------------ Models to Migrate (in order) ------------------------------------------
 
-(def ^:private entities
+(def entities
   "Entities in the order they should be serialized/deserialized. This is done so we make sure that we load load
   instances of entities before others that might depend on them, e.g. `Databases` before `Tables` before `Fields`."
   [Database
@@ -83,6 +82,8 @@
    Revision
    ViewLog
    Session
+   Collection
+   CollectionRevision
    Dashboard
    Card
    CardFavorite
@@ -97,10 +98,9 @@
    PermissionsGroupMembership
    Permissions
    PermissionsRevision
-   Collection
-   CollectionRevision
    DashboardFavorite
    Dimension
+   NativeQuerySnippet
    ;; migrate the list of finished DataMigrations as the very last thing (all models to copy over should be listed
    ;; above this line)
    DataMigrations])
@@ -115,42 +115,55 @@
 
 (defn- h2-details [h2-connection-string-or-nil]
   (let [h2-filename (add-file-prefix-if-needed (or h2-connection-string-or-nil @metabase.db/db-file))]
-    (mdb/jdbc-details {:type :h2, :db (str h2-filename ";IFEXISTS=TRUE")})))
+    (mdb/jdbc-spec {:type :h2, :db (str h2-filename ";IFEXISTS=TRUE")})))
 
 
 ;;; ------------------------------------------- Fetching & Inserting Rows --------------------------------------------
 
-(defn- insert-entity! [target-db-conn {:keys [table], :as entity} objs]
-  ;; TODO - I don't think the print+flush is working as intended :/
-  (print (u/format-color 'blue "Transferring %d instances of %s..." (count objs) (:name entity)))
-  (flush)
-  ;; 1) `:sizeX` and `:sizeY` come out of H2 as `:sizex` and `:sizey` because of automatic lowercasing; fix the
-  ;;    names of these before putting into the new DB
+(defn- objects->colums+values
+  "Given a sequence of objects/rows fetched from the H2 DB, return a the `columns` that should be used in the `INSERT`
+  statement, and a sequence of rows (as seqeunces)."
+  [objs]
+  ;; 1) `:sizeX` and `:sizeY` come out of H2 as `:sizex` and `:sizey` because of automatic lowercasing; fix the names
+  ;;    of these before putting into the new DB
+  ;;
   ;; 2) Need to wrap the column names in quotes because Postgres automatically lowercases unquoted identifiers
-  (let [ks   (keys (set/rename-keys (first objs) {:sizex :sizeX, :sizey :sizeY}))
-        cols (for [k ks]
-               ((db/quote-fn) (name k)))]
-    ;; The connection closes prematurely on occasion when we're inserting thousands of rows at once. Break into
-    ;; smaller chunks so connection stays alive
-    (doseq [chunk (partition-all 300 objs)
-            :let  [vals (for [row chunk]
-                          (map row ks))]]
-      (print (color/blue \.))
-      (flush)
-      (try
-        (jdbc/insert-multi! target-db-conn table cols vals)
-        (catch SQLException e
-          (jdbc/print-sql-exception-chain e)
-          (throw e)))))
-  (println-ok))
+  (let [source-keys (keys (first objs))
+        dest-keys   (for [k source-keys]
+                      ((db/quote-fn) (name (case k
+                                             :sizex :sizeX
+                                             :sizey :sizeY
+                                             k))))]
+    {:cols dest-keys
+     :vals (for [row objs]
+             (map row source-keys))}))
 
+(def ^:private chunk-size 100)
+
+(defn- insert-chunk! [target-db-conn table-name chunkk]
+  (print (color/blue \.))
+  (flush)
+  (try
+    (let [{:keys [cols vals]} (objects->colums+values chunkk)]
+      (jdbc/insert-multi! target-db-conn table-name cols vals))
+    (catch SQLException e
+      (jdbc/print-sql-exception-chain e)
+      (throw e))))
+
+(defn- insert-entity! [target-db-conn {table-name :table, entity-name :name} objs]
+  (print (u/format-color 'blue "Transfering %d instances of %s..." (count objs) entity-name))
+  (flush)
+  ;; The connection closes prematurely on occasion when we're inserting thousands of rows at once. Break into
+  ;; smaller chunks so connection stays alive
+  (doseq [chunk (partition-all chunk-size objs)]
+    (insert-chunk! target-db-conn table-name chunk))
+  (println-ok))
 
 (defn- load-data! [target-db-conn h2-connection-string-or-nil]
   (jdbc/with-db-connection [h2-conn (h2-details h2-connection-string-or-nil)]
-    (doseq [e     entities
-            :let  [rows (for [row (jdbc/query h2-conn [(str "SELECT * FROM " (name (:table e)))])]
-                          (m/map-vals u/jdbc-clob->str row))]
-            :when (seq rows)]
+    (doseq [{table-name :table, :as e} entities
+            :let                       [rows (jdbc/query h2-conn [(str "SELECT * FROM " (name table-name))])]
+            :when                      (seq rows)]
       (insert-entity! target-db-conn e rows))))
 
 
@@ -203,7 +216,7 @@
 
 ;; Update the sequence nextvals.
 (defmethod update-sequence-values! :postgres []
-  (jdbc/with-db-transaction [target-db-conn (mdb/jdbc-details)]
+  (jdbc/with-db-transaction [target-db-conn (mdb/jdbc-spec)]
     (println (u/format-color 'blue "Setting postgres sequence ids to proper values..."))
     (doseq [e     entities
             :when (not (contains? entities-without-autoinc-ids e))
@@ -214,6 +227,9 @@
       (jdbc/db-query-with-resultset target-db-conn [sql] :val))
     (println-ok)))
 
+(defn- mb-db-populated? [conn]
+  (binding [db/*db-connection* conn]
+    (pos? (db/count Setting))))
 
 ;;; --------------------------------------------------- Public Fns ---------------------------------------------------
 
@@ -225,8 +241,16 @@
   [h2-connection-string-or-nil]
   (mdb/setup-db!)
 
-  (jdbc/with-db-transaction [target-db-conn (mdb/jdbc-details)]
+  (assert (#{:postgres :mysql} (mdb/db-type))
+    (trs "Metabase can only transfer data from H2 to Postgres or MySQL/MariaDB."))
+
+  (jdbc/with-db-transaction [target-db-conn (mdb/jdbc-spec)]
     (jdbc/db-set-rollback-only! target-db-conn)
+
+    (println (u/format-color 'blue "Testing if target DB is already populated..."))
+    (assert (not (mb-db-populated? target-db-conn))
+      (trs "Target DB is already populated!"))
+    (println-ok)
 
     (println (u/format-color 'blue "Temporarily disabling DB constraints..."))
     (disable-db-constraints! target-db-conn)
